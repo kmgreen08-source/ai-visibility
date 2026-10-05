@@ -1,0 +1,490 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// One "prospect/client" tracked over time. A single Analysis can have many
+// Snapshots (re-runs), so trend lines are just "compare snapshots for this
+// analysis" rather than a separate concept.
+model Analysis {
+  id             String   @id @default(cuid())
+  companyName    String
+  companyUrl     String?
+  categoryHint   String?
+  status         String   @default("draft") // draft | profiling | ready | running | complete | failed
+  createdBy      String?
+  isDemo         Boolean  @default(false)
+  shareToken     String?  @unique
+  shareRevoked   Boolean  @default(false)
+
+  // Scheduled re-runs (retainer clients). The actual trigger is a cron/queue
+  // concern (Step 7 build), these fields just record intent + bookkeeping.
+  scheduleEnabled        Boolean   @default(false)
+  scheduleFrequencyDays  Int       @default(7)
+  nextScheduledRunAt     DateTime?
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  profile          CompanyProfile?
+  promptSet        PromptSet?
+  snapshots        Snapshot[]
+  coverageItems    CoverageItem[]
+  confounderEvents ConfounderEvent[]
+
+  @@index([status])
+}
+
+// The confirmed/edited profile + competitor set for an analysis. This is the
+// LIVE, editable version shown in the new-analysis UI. PromptSetVersion below
+// freezes a copy of the competitor set at each versioning point so historical
+// runs stay comparable even if the live profile changes later.
+model CompanyProfile {
+  id                    String   @id @default(cuid())
+  analysisId            String   @unique
+  analysis              Analysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  description           String
+  category              String
+  icp                   String
+  audienceType          String   @default("consumer") // "consumer" | "business" — drives which prompt theme set + bias-check jargon list applies
+  capabilities          String // JSON string[]
+  aliases               String   @default("[]") // JSON string[] — the target company's own aliases/former names
+  aliasesVerified        Boolean  @default(false) // true only if aliases came from fetched site text, news, or the user — never bare model recall
+  sources                String?  // JSON [{url, title?}] — pages actually fetched and given to the model (real URLs now, not browser_search-era artifacts)
+  suggestedCompetitors  String // JSON [{name, url, type, rationale, confidence, aliases, aliasesVerified}] — the raw suggestion, kept for reference
+  confirmedCompetitors  String // JSON [{name, url}] — what the user actually approved (3-5)
+
+  // Provenance: "groq" | "openai" | "anthropic" | "heuristic" | "manual" —
+  // shown in the UI so a value generated from model knowledge (no web
+  // search, possibly stale) is never mistaken for a verified fact.
+  profileSource     String @default("groq")
+  competitorsSource String @default("groq")
+  // Separate from profileSource/competitorsSource: whether the generation was
+  // actually grounded in fetched site/news text, vs. bare model-knowledge
+  // recall (still tagged "groq" in that case, but unverified — see
+  // lib/siteFetch.ts and the UI disclaimer).
+  profileGrounded     Boolean @default(false)
+  competitorsGrounded Boolean @default(false)
+
+  updatedAt             DateTime @updatedAt
+}
+
+// Logical container for an analysis's versioned prompt/competitor sets.
+// One-to-one with Analysis; the actual locked content lives on
+// PromptSetVersion so "current version" is just the highest versionNumber.
+model PromptSet {
+  id         String   @id @default(cuid())
+  analysisId String   @unique
+  analysis   Analysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  versions PromptSetVersion[]
+}
+
+// A locked prompt set + competitor set, comparable across every Snapshot
+// that runs against it. Editing prompts (or the competitor set they were
+// generated from) creates a new version rather than mutating this one, so
+// trend charts never silently blend two different question sets.
+model PromptSetVersion {
+  id                  String    @id @default(cuid())
+  promptSetId         String
+  promptSet           PromptSet @relation(fields: [promptSetId], references: [id], onDelete: Cascade)
+  versionNumber       Int
+  competitorsSnapshot String // JSON [{name, url}] — competitor set locked at creation time
+  changeNote          String? // why this version was created, e.g. "added Gorgias as competitor"
+  locked              Boolean   @default(false) // once true, prompts are read-only; any edit clones into a new version
+  createdAt           DateTime  @default(now())
+
+  prompts   Prompt[]
+  snapshots Snapshot[]
+
+  @@unique([promptSetId, versionNumber])
+}
+
+model Prompt {
+  id                  String           @id @default(cuid())
+  promptSetVersionId  String
+  promptSetVersion    PromptSetVersion @relation(fields: [promptSetVersionId], references: [id], onDelete: Cascade)
+  text                String
+  theme               String
+  branded             Boolean          @default(false)
+  orderIndex          Int              @default(0)
+  // "groq" | "openai" | "anthropic" | "heuristic" | "manual" — manual once a
+  // human types or edits the text directly, regardless of how it started.
+  source              String           @default("groq")
+  createdAt           DateTime         @default(now())
+
+  responses         ProviderResponse[]
+  biasCheckRecords  BiasCheckRecord[]
+
+  @@index([promptSetVersionId])
+}
+
+// Bias-check history, keyed to a specific prompt so edits/deletes elsewhere
+// never misalign it (the earlier position-indexed version of this had
+// exactly that bug). One prompt can accumulate several records over its
+// life — e.g. flagged at generation, then flagged again after a later edit.
+// "accepted" covers both the automatic apply at bulk generation time and a
+// user explicitly choosing the suggested rewrite; "overridden" means the
+// user kept their own wording after seeing the flag.
+model BiasCheckRecord {
+  id                 String   @id @default(cuid())
+  promptId           String
+  prompt             Prompt   @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  promptSetVersionId String // denormalized for "full history per version" queries without a join
+  original           String
+  rewritten          String
+  reason             String // brand_leak | product_jargon | leading_framing
+  explanation        String
+  status             String   @default("pending") // pending | accepted | overridden
+  rewriteSource      String   @default("heuristic") // "groq" | "openai" | "anthropic" | "heuristic" — how the suggested rewrite was produced
+  resolvedAt         DateTime?
+  createdAt          DateTime @default(now())
+
+  @@index([promptId])
+  @@index([promptSetVersionId])
+}
+
+// One run of the full pipeline (provider responses -> judge -> news ->
+// findings) against a specific, locked PromptSetVersion. Re-running an
+// analysis creates a new Snapshot against the current version (or a new
+// version, if prompts/competitors changed first).
+model Snapshot {
+  id                 String           @id @default(cuid())
+  analysisId         String
+  analysis           Analysis         @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  promptSetVersionId String
+  promptSetVersion   PromptSetVersion @relation(fields: [promptSetVersionId], references: [id], onDelete: Cascade)
+  runNumber          Int
+  status             String    @default("pending") // pending | running | judging | scanning_news | analyzing | complete | complete_with_errors | failed
+  engines            String // JSON string[] of engine keys configured for this run
+  samplesPerPrompt   Int       @default(1) // 1-3; >1 means metrics use mention rate across samples
+  dualMode           Boolean   @default(false) // run grounded + ungrounded for engines that support both
+  estimatedCost      Float?
+  actualCost         Float?
+  callCount          Int?
+  errorMessage       String?
+  createdAt          DateTime  @default(now())
+  completedAt        DateTime?
+
+  // Step 4 news scan state — separate from the overall snapshot status
+  // because the AI-visibility run and the news scan can finish at different
+  // times and with different completeness (e.g. some brands rate-limited).
+  newsScanStatus      String?   // "running" | "complete" | "partial" | "failed" | null (never run)
+  newsScanAt          DateTime? // when the news scan last finished an attempt (success or not)
+  newsScanUserConfirmed Boolean @default(false) // user explicitly accepted an incomplete/zero-included result as final, rather than a filter problem
+
+  responses       ProviderResponse[]
+  newsArticles    NewsArticle[]
+  newsQueryLogs   NewsQueryLog[]
+  findings        Finding[]
+  coverageMatches CoverageMatch[]
+
+  @@index([analysisId])
+  @@index([promptSetVersionId])
+}
+
+model ProviderResponse {
+  id           String   @id @default(cuid())
+  promptId     String
+  prompt       Prompt   @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  snapshotId   String
+  snapshot     Snapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  engine       String // "openai" | "anthropic" | "gemini" | "perplexity" | "serpapi" — measured engines only, never "groq"
+  mode         String   @default("grounded") // "grounded" (web search/tool on) | "ungrounded" (model only)
+  sampleIndex  Int      @default(0) // 0-based, for the "samples per prompt" setting (up to 3)
+  model        String // model version string as returned by the API, when available
+  status       String   @default("pending") // pending | ok | error
+  fullText     String?
+  citations    String? // JSON [{url, domain}]
+  errorMessage String?
+  retryCount   Int      @default(0)
+  latencyMs    Int?
+  costUsd      Float?
+  cachedFrom   String? // id of an earlier ProviderResponse this was copied from (same prompt/engine/mode/sample, same day) instead of re-calling the provider
+  timestamp    DateTime @default(now())
+
+  extraction      ExtractedAnalysis?
+  coverageMatches CoverageMatch[]
+
+  @@index([promptId])
+  @@index([snapshotId])
+  @@unique([snapshotId, promptId, engine, mode, sampleIndex])
+}
+
+// LLM-as-judge structured output for one ProviderResponse. A human review can
+// override any field — metrics read the override when present, the judge's
+// original value otherwise, and both are kept (never destructively overwritten)
+// so "what did the judge say vs. what did we correct it to" stays visible.
+model ExtractedAnalysis {
+  id                   String           @id @default(cuid())
+  responseId           String           @unique
+  response             ProviderResponse @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  brandMentions        String // JSON [{brand, isTarget, rank, positioning, sentiment, description, domainCited}] — the judge's raw output
+  otherBrandsMentioned String // JSON string[]
+  judgeModel           String? // which model produced this extraction
+  judgeSource          String   @default("heuristic") // "groq" | "openai" | "anthropic" | "heuristic" (ground truth, demo only)
+  wasRetried           Boolean  @default(false) // true if the first structured-output attempt failed schema validation
+  flaggedForReview     Boolean  @default(false) // true if validation still failed after the retry, OR a consistency check failed (see consistencyIssues)
+  consistencyIssues    String?  // JSON string[] — automated check results: every extracted brand must appear in the raw text (by name/alias) and vice versa; null = checked and clean, not just "not checked"
+  correctedBrandMentions String? // JSON, same shape as brandMentions — set once a human reviews/corrects it; null = judge output stands
+  correctedBy          String?
+  correctedAt          DateTime?
+  createdAt            DateTime         @default(now())
+}
+
+// Every row here is a real article as returned by the GDELT (or NewsAPI)
+// search response — url/title/domain are never model-generated. Rows that
+// fail the pipeline's own filtering (name-collision, duplicate, Groq
+// relevance, or the per-brand cap) are kept with excluded=true rather than
+// deleted, so before/after counts are auditable and a human can restore one
+// that was filtered wrongly.
+model NewsArticle {
+  id          String   @id @default(cuid())
+  snapshotId  String
+  snapshot    Snapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  brand       String
+  title       String
+  url         String
+  domain      String
+  publishedAt DateTime
+  sentiment   String? // positive | neutral | negative | null = not classified
+  topic       String?
+  dedupeHash  String
+  // How ${brand} is used in this piece — "primary_subject" | "quoted_or_cited" | "passing_mention" — all three count as relevant/included. Null for an excluded row (a true name collision, or filtered before classification).
+  mentionType String?
+  // How sentiment/topic were decided — "groq" | "unclassified" (no key configured, or the call failed — NEVER a guessed value). Null = not attempted (article was excluded before classification).
+  classificationSource String?
+  excluded       Boolean @default(false)
+  exclusionReason String? // "name-collision filter" | "name collision (groq)" | "over per-brand cap" | null
+  // Syndicated copies of the SAME story (same normalized title/dedupeHash)
+  // are rolled into their canonical row rather than stored/excluded as
+  // separate "duplicate" rows — reach across outlets is a real PR metric,
+  // not noise. syndicatedCount includes the canonical copy itself (1 = only
+  // one known copy); syndicatedOutlets lists the OTHER domains that carried it.
+  syndicatedCount   Int     @default(1)
+  syndicatedOutlets String? // JSON string[]
+
+  @@index([snapshotId])
+  @@index([dedupeHash])
+}
+
+// One row per GDELT (or NewsAPI) query actually attempted — success,
+// genuinely-empty, rate-limited, or errored are recorded distinctly so a
+// rate limit is never silently indistinguishable from "no coverage exists."
+// snapshotId is null for a competitor-discovery query, which runs during
+// profile generation, before any snapshot exists.
+model NewsQueryLog {
+  id           String    @id @default(cuid())
+  snapshotId   String?
+  snapshot     Snapshot? @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  purpose      String // "news_scan" | "competitor_discovery"
+  query        String // the literal search string sent to the adapter
+  outcome      String // "success" | "empty" | "rate_limited" | "error"
+  resultCount  Int       @default(0)
+  cached       Boolean   @default(false)
+  errorMessage String?
+  queriedAt    DateTime  @default(now())
+
+  @@index([snapshotId])
+}
+
+// Short-lived cache of a raw adapter response, keyed by the literal query
+// string — lets a demo reset or a retried scan reuse a just-fetched result
+// instead of hitting GDELT's rate limit again for the same query.
+model NewsQueryCache {
+  query      String   @id
+  fetchedAt  DateTime
+  resultJson String // JSON NewsArticle[]
+}
+
+model Finding {
+  id           String   @id @default(cuid())
+  snapshotId   String
+  snapshot     Snapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  kind         String // "summary" | "action" | "gap"
+  text         String
+  evidenceRefs String? // JSON {promptIds:[], articleIds:[]}
+  orderIndex   Int      @default(0)
+
+  @@index([snapshotId])
+}
+
+// ---------------- Coverage Impact Tracking ----------------
+
+// One earned-coverage placement (press, byline, podcast, social, Reddit/forum
+// thread, review site, analyst mention) an agency logs for a client.
+model CoverageItem {
+  id            String   @id @default(cuid())
+  analysisId    String
+  analysis      Analysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  url           String
+  canonicalUrl  String // normalized (protocol/www/utm/trailing-slash stripped) for direct-citation matching
+  outletName    String?
+  outletDomain  String
+  type          String // press | byline | podcast | social | reddit_forum | review_site | analyst
+  publishedAt   DateTime
+  title         String?
+  summary       String? // fetched + user-editable
+  keyClaims     String? // JSON string[] — stats/positioning lines/customer names the placement was meant to land
+  source        String   @default("manual") // manual | suggested_from_news | csv_import
+  addedBy       String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  syndications CoverageSyndication[]
+  matches      CoverageMatch[]
+  lifts        CoverageLift[]
+
+  @@index([analysisId])
+  @@index([canonicalUrl])
+}
+
+// Known syndicated copies of a coverage item (e.g. a PR-Newswire piece
+// mirrored on Yahoo Finance/Benzinga) — checked alongside the primary URL for
+// Tier-1 direct-citation matching, since AI engines may cite the mirror.
+model CoverageSyndication {
+  id             String       @id @default(cuid())
+  coverageItemId String
+  coverageItem   CoverageItem @relation(fields: [coverageItemId], references: [id], onDelete: Cascade)
+  url            String
+  domain         String
+
+  @@index([coverageItemId])
+}
+
+// Tier 1 (direct_citation) or Tier 2 (message_echo) evidence — always tied to
+// one specific ProviderResponse. Tier 3 (visibility_lift) is a computed
+// aggregate instead; see CoverageLift.
+model CoverageMatch {
+  id             String           @id @default(cuid())
+  coverageItemId String
+  coverageItem   CoverageItem     @relation(fields: [coverageItemId], references: [id], onDelete: Cascade)
+  snapshotId     String
+  snapshot       Snapshot         @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  responseId     String
+  response       ProviderResponse @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  tier           String // "direct_citation" | "message_echo"
+  matchedUrl     String? // tier 1: the citation URL that matched (primary or a syndication)
+  matchedPassage String? // tier 2: the passage in the response that echoes a key claim
+  confidence     Float? // tier 2 only — judge's confidence the echo is real, not coincidental phrasing
+  createdAt      DateTime @default(now())
+
+  @@index([coverageItemId])
+  @@index([snapshotId])
+}
+
+// Tier 3 (visibility_lift) evidence: a computed before/after comparison of
+// the client's mention rate/position/citation rate on theme-matched prompts,
+// around a coverage item's publish date — with the same stats for
+// competitors and an unrelated control theme, so it's never read as causal
+// on its own. Recomputed as new snapshots land.
+model CoverageLift {
+  id             String       @id @default(cuid())
+  coverageItemId String
+  coverageItem   CoverageItem @relation(fields: [coverageItemId], references: [id], onDelete: Cascade)
+  theme          String // the prompt theme judged most related to this coverage item's topic
+
+  preMentionRate  Float?
+  postMentionRate Float?
+  preAvgPosition  Float?
+  postAvgPosition Float?
+  preCitationRate Float?
+  postCitationRate Float?
+
+  preRunCount  Int // snapshots before the publish date used in the window
+  postRunCount Int
+  sufficientData Boolean @default(false) // false unless preRunCount >= 2 — guardrail from the brief
+
+  competitorDeltas   String? // JSON [{brand, preMentionRate, postMentionRate}] — same metric for competitors, as a comparison
+  controlThemeDelta  String? // JSON {theme, preMentionRate, postMentionRate} — an unrelated theme, as a control
+
+  computedAt DateTime @default(now())
+
+  @@index([coverageItemId])
+}
+
+// Timeline annotations for known confounders, so a visibility change doesn't
+// get read as coverage impact when it was actually a model swap, a
+// prompt-set edit, or a competitor's own news spike.
+model ConfounderEvent {
+  id                        String   @id @default(cuid())
+  analysisId                String
+  analysis                  Analysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  kind                      String // "model_change" | "promptset_version_change" | "competitor_news_spike"
+  occurredAt                DateTime
+  description               String
+  autoDetected              Boolean  @default(true)
+  relatedSnapshotId         String?
+  relatedPromptSetVersionId String?
+  relatedNewsArticleId      String?
+  createdAt                 DateTime @default(now())
+
+  @@index([analysisId])
+}
+
+// Singleton-ish settings row (id always "default").
+model Settings {
+  id                 String  @id @default("default")
+  agencyName         String  @default("Your Agency")
+  agencyLogoUrl      String?
+  primaryColor       String  @default("#1f6feb")
+  defaultEngines     String  @default("[\"openai\",\"anthropic\",\"gemini\",\"perplexity\"]") // JSON string[] — measured AI-visibility engines only
+  defaultPromptCount Int     @default(24)
+  newsLookbackDays   Int     @default(90)
+
+  // Per-task reasoning-model config: JSON { [task]: { provider, model } }.
+  // "provider" is "groq" | "openai" | "anthropic". This is what makes the
+  // reasoning layer swappable from settings instead of code — see
+  // lib/reasoningModel.ts DEFAULT_TASK_MODELS for the shape and defaults.
+  taskModels String @default("{}")
+
+  // Free-tier-friendly defaults for the Groq-specific concurrency gate
+  // (shared rate limits with the personal-site chatbot) — not per-engine
+  // run concurrency, which is separate (see lib/runEngine.ts).
+  groqConcurrency Int @default(2)
+}
+
+// Cache for reasoning-task outputs (profile, prompt generation, bias check,
+// judge, news classification) keyed by task+inputs+model — "cache every
+// result so re-runs and page reloads don't re-call Groq." Deliberately
+// separate from the measured-engine ProviderResponse cache (same day-based
+// idea, different purpose): this one is keyed by content hash since these
+// calls aren't tied to a single locked prompt-set run.
+model ReasoningCache {
+  id        String   @id @default(cuid())
+  task      String
+  provider  String
+  model     String
+  inputHash String
+  output    String // JSON
+  createdAt DateTime @default(now())
+
+  @@unique([task, provider, model, inputHash])
+}
+
+// A point-in-time reliability check: run the currently-configured judge
+// model against the demo's seeded ground truth (the only place a "correct
+// answer" is actually known) and record per-field agreement. Kept as rows,
+// not recomputed on every page view, so re-running is a deliberate action
+// (it calls the judge ~100 times) and old results stay comparable when the
+// configured model changes later.
+model JudgeAgreementReport {
+  id                    String   @id @default(cuid())
+  createdAt             DateTime @default(now())
+  judgeProvider         String
+  judgeModel            String
+  fixturesTested        Int
+  brandSetMatchPct      Int
+  orderMatchPct         Int
+  positioningMatchPct   Int
+  sentimentMatchPct     Int
+  citationMatchPct      Int
+  consistencyFailures   Int
+  judgeSelfFlagged      Int
+  disagreementExamples  String // JSON string[]
+}

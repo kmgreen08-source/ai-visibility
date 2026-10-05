@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ai-visibility-pitch",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-c", "cd /Users/kevingreen/Desktop/ai-visibility-pitch && exec npm run dev -- -p 3002"],
+      "port": 3002
+    }
+  ]
+}
